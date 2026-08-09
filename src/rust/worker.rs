@@ -187,7 +187,7 @@ impl Worker {
                         self.request_timeout
                     );
                     self.timeout_count.fetch_add(1, Ordering::Relaxed);
-                    self.recover_stuck_worker_or_exit("lock wait timeout");
+                    self.recover_stuck_worker("lock wait timeout");
                 }
                 self.record_error(e.to_string());
                 return Err(e);
@@ -346,7 +346,7 @@ impl Worker {
         self.record_restart(reason);
     }
 
-    fn recover_stuck_worker_or_exit(&self, reason: &'static str) {
+    fn recover_stuck_worker(&self, reason: &'static str) {
         let stuck = self
             .state
             .lock()
@@ -359,10 +359,22 @@ impl Worker {
         }
         let pid = self.pid.swap(0, Ordering::Relaxed);
         if pid == 0 {
+            // Stale request marker with no worker process behind it (the
+            // worker was already killed/abandoned by an earlier timeout, but
+            // state.current is still set). Previously this EXITED the whole
+            // daemon (code 70), which made Docker restart the container and
+            // dropped EVERY in-flight decrypt connection at once — the worst
+            // single outage in production logs. The correct recovery is to
+            // clear the stale marker and let the next request spawn a fresh
+            // worker; this request returns the ordinary
+            // "worker busy timed out" error to its client.
+            if let Ok(mut state) = self.state.lock() {
+                state.current = None;
+            }
             eprintln!(
-                "wrapperd: fatal: worker request is stale, but no worker pid is available; exiting for container restart"
+                "wrapperd: stale worker request (no worker pid); cleared state, continuing"
             );
-            std::process::exit(70);
+            return;
         }
         self.record_restart(reason);
         thread::spawn(move || {
