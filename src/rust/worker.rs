@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,21 +41,30 @@ struct WorkerProcess {
     stdout: ChildStdout,
 }
 
+/// One slot in the worker pool. `proc` is None when the slot is empty (never
+/// spawned yet, or its process is currently leased out for an in-flight
+/// request). `leased` marks a request that has checked the process out.
+struct WorkerSlot {
+    proc: Option<WorkerProcess>,
+    pid: u32,
+    leased: bool,
+    current: Option<CurrentRequest>,
+}
+
 pub struct Worker {
     launcher: String,
     version: String,
     request_timeout: Duration,
+    pool_size: usize,
     next_id: AtomicU32,
     restart_count: AtomicU32,
     timeout_count: AtomicU32,
     waiting_count: AtomicU32,
-    pid: AtomicU32,
-    proc: Mutex<Option<WorkerProcess>>,
+    pool: Mutex<Vec<WorkerSlot>>,
     state: Mutex<WorkerState>,
 }
 
 struct WorkerState {
-    current: Option<CurrentRequest>,
     last_error: Option<String>,
     last_restart_reason: Option<String>,
 }
@@ -67,13 +76,21 @@ struct CurrentRequest {
     started: Instant,
 }
 
-struct RequestTracker<'a> {
-    worker: &'a Worker,
-    id: u32,
-}
-
 struct WaitTracker<'a> {
     worker: &'a Worker,
+}
+
+/// A worker process checked out of the pool for the duration of one request.
+/// On drop it is either returned to its slot (healthy) or killed and the slot
+/// left empty for a fresh spawn (discard / dead child). Because I/O happens on
+/// the leased process without holding the pool lock, concurrent requests run
+/// on their own workers in parallel.
+struct LeasedWorker<'a> {
+    worker: &'a Worker,
+    slot_idx: usize,
+    proc: Option<WorkerProcess>,
+    pid: u32,
+    discard: bool,
 }
 
 impl Worker {
@@ -82,14 +99,13 @@ impl Worker {
             launcher: launcher.to_string(),
             version,
             request_timeout: worker_timeout(),
+            pool_size: pool_size(),
             next_id: AtomicU32::new(1),
             restart_count: AtomicU32::new(0),
             timeout_count: AtomicU32::new(0),
             waiting_count: AtomicU32::new(0),
-            pid: AtomicU32::new(0),
-            proc: Mutex::new(None),
+            pool: Mutex::new(Vec::new()),
             state: Mutex::new(WorkerState {
-                current: None,
                 last_error: None,
                 last_restart_reason: None,
             }),
@@ -97,17 +113,26 @@ impl Worker {
     }
 
     pub fn ensure_started(&self) -> Result<(), WorkerError> {
-        let mut guard = self
-            .proc
-            .lock()
-            .map_err(|_| WorkerError::Unavailable("worker mutex poisoned".to_string()))?;
-        if let Some(p) = guard.as_mut() {
-            if p.child.try_wait().map_err(io_err)?.is_none() {
-                return Ok(());
-            }
-            self.pid.store(0, Ordering::Relaxed);
+        let mut pool = self.pool.lock().map_err(|_| {
+            WorkerError::Unavailable("worker pool mutex poisoned".to_string())
+        })?;
+        if pool.is_empty() {
+            *pool = (0..self.pool_size)
+                .map(|_| WorkerSlot {
+                    proc: None,
+                    pid: 0,
+                    leased: false,
+                    current: None,
+                })
+                .collect();
         }
-        *guard = Some(self.spawn()?);
+        // Eagerly spawn the first worker so /health works immediately; the
+        // rest of the pool spawns on demand as concurrent requests arrive.
+        if pool[0].proc.is_none() {
+            let (proc, pid) = spawn_worker(&self.launcher)?;
+            pool[0].proc = Some(proc);
+            pool[0].pid = pid;
+        }
         Ok(())
     }
 
@@ -116,18 +141,30 @@ impl Worker {
     }
 
     pub fn snapshot(&self) -> Value {
-        let current = self.state.lock().ok().and_then(|s| s.current.clone());
+        let (pids, current, workers_running, active_requests) = match self.pool.lock() {
+            Ok(pool) => {
+                let pids: Vec<u32> = pool.iter().filter(|s| s.pid != 0).map(|s| s.pid).collect();
+                let current = pool
+                    .iter()
+                    .find(|s| s.leased)
+                    .and_then(|s| s.current.clone());
+                let workers_running = pool.iter().filter(|s| s.proc.is_some()).count();
+                let active = pool.iter().filter(|s| s.leased).count();
+                (pids, current, workers_running, active)
+            }
+            Err(_) => (Vec::new(), None, 0, 0),
+        };
         let (last_error, last_restart_reason) = self
             .state
             .lock()
             .map(|s| (s.last_error.clone(), s.last_restart_reason.clone()))
             .unwrap_or((None, None));
-        let pid = match self.pid.load(Ordering::Relaxed) {
-            0 => None,
-            pid => Some(pid),
-        };
         json!({
-            "pid": pid,
+            "pids": pids,
+            "pid": pids.first().copied().unwrap_or(0),
+            "pool_size": self.pool_size,
+            "workers_running": workers_running,
+            "active_requests": active_requests,
             "request_timeout_secs": self.request_timeout.as_secs(),
             "restart_count": self.restart_count.load(Ordering::Relaxed),
             "timeout_count": self.timeout_count.load(Ordering::Relaxed),
@@ -177,36 +214,8 @@ impl Worker {
     fn request(&self, opcode: u16, payload: Vec<u8>) -> Result<protocol::Frame, WorkerError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let deadline = Instant::now() + self.request_timeout;
-        let wait_tracker = self.track_wait();
-        let mut guard = match lock_worker_timeout(&self.proc, deadline) {
-            Ok(g) => g,
-            Err(e) => {
-                if e.to_string().contains("timed out") {
-                    eprintln!(
-                        "wrapperd: worker request opcode={opcode} timed out waiting for worker after {:?}",
-                        self.request_timeout
-                    );
-                    self.timeout_count.fetch_add(1, Ordering::Relaxed);
-                    self.recover_stuck_worker("lock wait timeout");
-                }
-                self.record_error(e.to_string());
-                return Err(e);
-            }
-        };
-        drop(wait_tracker);
-        let _tracker = self.track_request(id, opcode);
-        if guard.is_none() {
-            *guard = Some(self.spawn()?);
-        }
-        let proc = guard
-            .as_mut()
-            .ok_or_else(|| WorkerError::Unavailable("worker missing".to_string()))?;
-        if proc.child.try_wait().map_err(io_err)?.is_some() {
-            *guard = Some(self.spawn()?);
-        }
-        let proc = guard
-            .as_mut()
-            .ok_or_else(|| WorkerError::Unavailable("worker missing".to_string()))?;
+        let mut lw = self.acquire(id, opcode)?;
+
         let req = protocol::Frame {
             kind: protocol::KIND_REQUEST,
             request_id: id,
@@ -214,112 +223,179 @@ impl Worker {
             flags: 0,
             payload,
         };
-        if let Err(e) = write_frame_timeout(&mut proc.stdin, &req, deadline) {
+
+        if let Err(e) = write_frame_timeout(&mut lw.proc_mut().stdin, &req, deadline) {
             if e.kind() == io::ErrorKind::TimedOut {
                 eprintln!(
-                    "wrapperd: worker request opcode={opcode} timed out while writing after {:?}; restarting worker",
+                    "wrapperd: worker request opcode={opcode} timed out while writing after {:?}; discarding worker",
                     self.request_timeout
                 );
                 self.timeout_count.fetch_add(1, Ordering::Relaxed);
-                self.abandon_locked_worker(&mut guard, "write timeout");
             } else {
-                self.abandon_locked_worker(&mut guard, "ipc write error");
+                eprintln!(
+                    "wrapperd: worker request opcode={opcode} ipc write error: {e}; discarding worker"
+                );
             }
             self.record_error(e.to_string());
+            lw.discard();
             return Err(WorkerError::Io(e.to_string()));
         }
-        let resp = match read_frame_timeout(&mut proc.stdout, deadline) {
+
+        let resp = match read_frame_timeout(&mut lw.proc_mut().stdout, deadline) {
             Ok(frame) => frame,
             Err(e) => {
                 if e.kind() == io::ErrorKind::TimedOut {
                     eprintln!(
-                        "wrapperd: worker request opcode={opcode} timed out after {:?}; restarting worker",
+                        "wrapperd: worker request opcode={opcode} timed out after {:?}; discarding worker",
                         self.request_timeout
                     );
                     self.timeout_count.fetch_add(1, Ordering::Relaxed);
-                    self.abandon_locked_worker(&mut guard, "response timeout");
                 } else {
-                    self.abandon_locked_worker(&mut guard, "ipc read error");
+                    eprintln!(
+                        "wrapperd: worker request opcode={opcode} ipc read error: {e}; discarding worker"
+                    );
                 }
                 self.record_error(e.to_string());
+                lw.discard();
                 return Err(WorkerError::Io(e.to_string()));
             }
         };
+
         if resp.kind != protocol::KIND_RESPONSE || resp.request_id != id || resp.opcode != opcode {
-            self.abandon_locked_worker(&mut guard, "mismatched ipc response");
             self.record_error("mismatched ipc response");
+            lw.discard();
             return Err(WorkerError::Protocol("mismatched ipc response".to_string()));
         }
+
+        drop(lw);
         Ok(resp)
     }
 
-    fn spawn(&self) -> Result<WorkerProcess, WorkerError> {
-        eprintln!("wrapperd: starting ipc worker {}", self.launcher);
-        let mut child = Command::new(&self.launcher)
-            .env("WRAPPER_MODE", "ipc-worker")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(io_err)?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| WorkerError::Io("worker stdin unavailable".to_string()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| WorkerError::Io("worker stdout unavailable".to_string()))?;
-        set_nonblocking(&stdin)?;
-        set_nonblocking(&stdout)?;
-        self.pid.store(child.id(), Ordering::Relaxed);
-        let _ = &self.version;
-        Ok(WorkerProcess {
-            child,
-            stdin,
-            stdout,
-        })
+    /// Check a worker process out of the pool for one request. Reuses an idle
+    /// live worker, or spawns into an empty slot, or (after the deadline) fails
+    /// with "worker pool busy timed out". Only the slot bookkeeping holds the
+    /// pool lock — the actual IPC runs on the leased process, so other requests
+    /// can lease other workers concurrently.
+    fn acquire(&self, id: u32, opcode: u16) -> Result<LeasedWorker<'_>, WorkerError> {
+        let deadline = Instant::now() + self.request_timeout;
+        let _wait = self.track_wait();
+        loop {
+            {
+                let mut pool = self.pool.lock().map_err(|_| {
+                    WorkerError::Unavailable("worker pool mutex poisoned".to_string())
+                })?;
+                if pool.is_empty() {
+                    *pool = (0..self.pool_size)
+                        .map(|_| WorkerSlot {
+                            proc: None,
+                            pid: 0,
+                            leased: false,
+                            current: None,
+                        })
+                        .collect();
+                }
+
+                // 1. Reuse an idle live worker.
+                for (idx, slot) in pool.iter_mut().enumerate() {
+                    if slot.leased {
+                        continue;
+                    }
+                    let mut proc = match slot.proc.take() {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let pid = slot.pid;
+                    match proc.child.try_wait() {
+                        Ok(Some(_)) => {
+                            // Died while idle; reap and skip this slot.
+                            let _ = proc.child.wait();
+                            slot.pid = 0;
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            slot.pid = 0;
+                            continue;
+                        }
+                    }
+                    slot.leased = true;
+                    slot.current = Some(CurrentRequest {
+                        id,
+                        opcode,
+                        started: Instant::now(),
+                    });
+                    return Ok(LeasedWorker {
+                        worker: self,
+                        slot_idx: idx,
+                        proc: Some(proc),
+                        pid,
+                        discard: false,
+                    });
+                }
+
+                // 2. Fill an empty slot with a fresh worker.
+                for (idx, slot) in pool.iter_mut().enumerate() {
+                    if slot.leased || slot.proc.is_some() {
+                        continue;
+                    }
+                    let (proc, pid) = spawn_worker(&self.launcher)?;
+                    slot.leased = true;
+                    slot.current = Some(CurrentRequest {
+                        id,
+                        opcode,
+                        started: Instant::now(),
+                    });
+                    return Ok(LeasedWorker {
+                        worker: self,
+                        slot_idx: idx,
+                        proc: Some(proc),
+                        pid,
+                        discard: false,
+                    });
+                }
+
+                // 3. All workers busy.
+                if Instant::now() >= deadline {
+                    self.timeout_count.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "wrapperd: worker request opcode={opcode} timed out waiting for a free worker after {:?}",
+                        self.request_timeout
+                    );
+                    return Err(WorkerError::Unavailable(
+                        "worker pool busy timed out".to_string(),
+                    ));
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn restart_after_delay(&self) {
+        // The worker response asked for a restart (e.g. auth/session state).
+        // Discard one idle worker so the next request spawns a fresh process.
         let old = {
-            let mut guard = match self.proc.lock() {
+            let mut pool = match self.pool.lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
-            guard.take()
+            for slot in pool.iter_mut() {
+                if !slot.leased && slot.proc.is_some() {
+                    let proc = slot.proc.take();
+                    slot.pid = 0;
+                    return proc;
+                }
+            }
+            None
         };
-        self.pid.store(0, Ordering::Relaxed);
-        cleanup_worker(old, "restart requested by worker response");
-        self.record_restart("restart requested by worker response");
-        thread::sleep(Duration::from_secs(1));
-        let mut guard = match self.proc.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if guard.is_some() {
-            return;
-        }
-        match self.spawn() {
-            Ok(p) => *guard = Some(p),
-            Err(e) => eprintln!("wrapperd: worker restart failed: {e}"),
+        if let Some(proc) = old {
+            self.record_restart("restart requested by worker response");
+            reap_worker(proc, "restart requested by worker response");
         }
     }
 
     fn track_wait(&self) -> WaitTracker<'_> {
         self.waiting_count.fetch_add(1, Ordering::Relaxed);
         WaitTracker { worker: self }
-    }
-
-    fn track_request(&self, id: u32, opcode: u16) -> RequestTracker<'_> {
-        if let Ok(mut state) = self.state.lock() {
-            state.current = Some(CurrentRequest {
-                id,
-                opcode,
-                started: Instant::now(),
-            });
-        }
-        RequestTracker { worker: self, id }
     }
 
     fn record_error(&self, error: impl Into<String>) {
@@ -333,56 +409,6 @@ impl Worker {
         if let Ok(mut state) = self.state.lock() {
             state.last_restart_reason = Some(reason.into());
         }
-    }
-
-    fn abandon_locked_worker(
-        &self,
-        guard: &mut MutexGuard<'_, Option<WorkerProcess>>,
-        reason: &'static str,
-    ) {
-        let old = guard.take();
-        self.pid.store(0, Ordering::Relaxed);
-        cleanup_worker(old, reason);
-        self.record_restart(reason);
-    }
-
-    fn recover_stuck_worker(&self, reason: &'static str) {
-        let stuck = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|s| s.current.clone())
-            .map(|r| r.started.elapsed() >= self.request_timeout)
-            .unwrap_or(false);
-        if !stuck {
-            return;
-        }
-        let pid = self.pid.swap(0, Ordering::Relaxed);
-        if pid == 0 {
-            // Stale request marker with no worker process behind it (the
-            // worker was already killed/abandoned by an earlier timeout, but
-            // state.current is still set). Previously this EXITED the whole
-            // daemon (code 70), which made Docker restart the container and
-            // dropped EVERY in-flight decrypt connection at once — the worst
-            // single outage in production logs. The correct recovery is to
-            // clear the stale marker and let the next request spawn a fresh
-            // worker; this request returns the ordinary
-            // "worker busy timed out" error to its client.
-            if let Ok(mut state) = self.state.lock() {
-                state.current = None;
-            }
-            eprintln!(
-                "wrapperd: stale worker request (no worker pid); cleared state, continuing"
-            );
-            return;
-        }
-        self.record_restart(reason);
-        thread::spawn(move || {
-            eprintln!("wrapperd: killing stuck worker pid={pid}: {reason}");
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
-        });
     }
 }
 
@@ -399,19 +425,68 @@ fn set_nonblocking<T: AsRawFd>(fd: &T) -> Result<(), WorkerError> {
     Ok(())
 }
 
-impl Drop for WaitTracker<'_> {
-    fn drop(&mut self) {
-        self.worker.waiting_count.fetch_sub(1, Ordering::Relaxed);
+impl<'a> LeasedWorker<'a> {
+    fn proc_mut(&mut self) -> &mut WorkerProcess {
+        self.proc.as_mut().expect("leased worker process is present")
+    }
+
+    /// Mark this worker for discard: on drop it is killed (not returned to
+    /// the pool) and the slot is left empty for a fresh spawn.
+    fn discard(mut self) {
+        self.discard = true;
     }
 }
 
-impl Drop for RequestTracker<'_> {
+impl<'a> Drop for LeasedWorker<'a> {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.worker.state.lock() {
-            if state.current.as_ref().map(|r| r.id) == Some(self.id) {
-                state.current = None;
+        let mut pool = match self.worker.pool.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                // Pool poisoned; just reap whatever process we hold.
+                if let Some(proc) = self.proc.take() {
+                    reap_worker(proc, "pool poisoned");
+                }
+                return;
             }
+        };
+        let slot = match pool.get_mut(self.slot_idx) {
+            Some(s) => s,
+            None => {
+                if let Some(proc) = self.proc.take() {
+                    reap_worker(proc, "slot missing");
+                }
+                return;
+            }
+        };
+        if let Some(proc) = self.proc.take() {
+            let mut proc = proc;
+            match proc.child.try_wait() {
+                Ok(None) if !self.discard => {
+                    // Healthy and not being discarded: return to the pool.
+                    slot.proc = Some(proc);
+                    slot.pid = self.pid;
+                }
+                _ => {
+                    // Dead, or being discarded: reap and leave the slot empty
+                    // so the next request spawns a fresh worker.
+                    slot.pid = 0;
+                    if self.discard {
+                        self.worker.record_restart("discarded worker");
+                    }
+                    reap_worker(proc, "discarded worker");
+                }
+            }
+        } else {
+            slot.pid = 0;
         }
+        slot.leased = false;
+        slot.current = None;
+    }
+}
+
+impl Drop for WaitTracker<'_> {
+    fn drop(&mut self) {
+        self.worker.waiting_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -424,42 +499,55 @@ fn worker_timeout() -> Duration {
         .unwrap_or_else(|| Duration::from_secs(60))
 }
 
+/// Number of independent Android worker processes for this wrapper instance.
+/// Default 3 (matches the addon's 3-concurrent-rip semaphore). Each worker
+/// serializes its own decrypt traffic, so concurrent rips each get their own
+/// worker instead of queuing behind a single process.
+fn pool_size() -> usize {
+    std::env::var("WRAPPER_WORKER_POOL")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| (1..=8).contains(v))
+        .unwrap_or(3)
+}
+
 fn io_err(e: io::Error) -> WorkerError {
     WorkerError::Io(e.to_string())
 }
 
-fn lock_worker_timeout(
-    proc: &Mutex<Option<WorkerProcess>>,
-    deadline: Instant,
-) -> Result<MutexGuard<'_, Option<WorkerProcess>>, WorkerError> {
-    loop {
-        match proc.try_lock() {
-            Ok(g) => return Ok(g),
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(WorkerError::Unavailable(
-                    "worker mutex poisoned".to_string(),
-                ));
-            }
-            Err(TryLockError::WouldBlock) => {
-                if Instant::now() >= deadline {
-                    return Err(WorkerError::Unavailable(
-                        "worker busy timed out".to_string(),
-                    ));
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
+/// Spawn a fresh Android worker process. Does not touch the pool (the caller
+/// holds the pool lock) — returns the process and its pid.
+fn spawn_worker(launcher: &str) -> Result<(WorkerProcess, u32), WorkerError> {
+    eprintln!("wrapperd: starting ipc worker {launcher}");
+    let mut child = Command::new(launcher)
+        .env("WRAPPER_MODE", "ipc-worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(io_err)?;
+    let pid = child.id();
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| WorkerError::Io("worker stdin unavailable".to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| WorkerError::Io("worker stdout unavailable".to_string()))?;
+    set_nonblocking(&stdin)?;
+    set_nonblocking(&stdout)?;
+    Ok((WorkerProcess { child, stdin, stdout }, pid))
 }
 
-fn cleanup_worker(proc: Option<WorkerProcess>, reason: &'static str) {
-    if let Some(mut proc) = proc {
-        thread::spawn(move || {
-            eprintln!("wrapperd: cleaning up old worker: {reason}");
-            let _ = proc.child.kill();
-            let _ = proc.child.wait();
-        });
-    }
+/// Kill + reap a worker process in the background so a wedged child never
+/// blocks the supervisor.
+fn reap_worker(proc: WorkerProcess, reason: &'static str) {
+    thread::spawn(move || {
+        eprintln!("wrapperd: cleaning up worker: {reason}");
+        let _ = proc.child.kill();
+        let _ = proc.child.wait();
+    });
 }
 
 fn write_frame_timeout(
