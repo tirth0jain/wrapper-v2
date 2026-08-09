@@ -1,11 +1,15 @@
 #include "apple/decrypt.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <exception>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "apple/fps_cert.inc"
 #include "apple/aarch64_sret_thunks.hpp"
@@ -154,21 +158,62 @@ DecryptResult decrypt_samples(const Loader& loader,
             (void)sv_ctx;
         }
 
-        attempt.plaintexts.reserve(chunks.size());
-        for (auto& chunk : chunks) {
-            if (chunk.empty()) {
-                *error = "empty sample";
-                attempt.plaintexts.clear();
-                return attempt;
+        // Parallel sample decryption (adapted from 5hojib/wrapper-v2 #5).
+        // fp_sample_decrypt is called with the SAME cached kd context from
+        // multiple threads; the context holds the FairPlay key schedule and
+        // the call is per-sample, so this is safe in practice. Thread count is
+        // capped at 4 so the shared kd context is never hammered harder than
+        // needed, and each index is handled by exactly one thread (stride t).
+        attempt.plaintexts.resize(chunks.size());
+
+        unsigned int hw = std::thread::hardware_concurrency();
+        unsigned int num_threads = (hw == 0) ? 2 : std::min(hw, 4u);
+        if (num_threads > chunks.size()) {
+            num_threads = static_cast<unsigned int>(chunks.size());
+        }
+        if (num_threads < 1) {
+            num_threads = 1;
+        }
+
+        std::vector<std::thread> threads;
+        std::atomic<bool> decrypt_error{false};
+        std::mutex error_mu;
+
+        for (unsigned int t = 0; t < num_threads; ++t) {
+            threads.emplace_back([&, t]() {
+                for (size_t i = t; i < chunks.size(); i += num_threads) {
+                    if (decrypt_error.load(std::memory_order_relaxed)) {
+                        break;
+                    }
+                    auto& chunk = chunks[i];
+                    if (chunk.empty()) {
+                        std::lock_guard<std::mutex> lock(error_mu);
+                        if (!decrypt_error.exchange(true)) {
+                            *error = "empty sample";
+                        }
+                        break;
+                    }
+                    const long status = s.fp_sample_decrypt(kd, 5u, chunk.data(), chunk.data(), chunk.size());
+                    if (status < 0) {
+                        std::lock_guard<std::mutex> lock(error_mu);
+                        if (!decrypt_error.exchange(true)) {
+                            *error = "FPS sample decrypt failed status=" + std::to_string(status);
+                            std::fprintf(stderr, "decrypt: fp_sample_decrypt failed status=%ld\n", status);
+                        }
+                        break;
+                    }
+                    attempt.plaintexts[i] = std::move(chunk);
+                }
+            });
+        }
+        for (auto& th : threads) {
+            if (th.joinable()) {
+                th.join();
             }
-            const long status = s.fp_sample_decrypt(kd, 5u, chunk.data(), chunk.data(), chunk.size());
-            if (status < 0) {
-                *error = "FPS sample decrypt failed status=" + std::to_string(status);
-                std::fprintf(stderr, "decrypt: fp_sample_decrypt failed status=%ld\n", status);
-                attempt.plaintexts.clear();
-                return attempt;
-            }
-            attempt.plaintexts.push_back(std::move(chunk));
+        }
+        if (decrypt_error.load()) {
+            attempt.plaintexts.clear();
+            return attempt;
         }
 
         attempt.ok = true;
