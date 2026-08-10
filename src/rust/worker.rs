@@ -549,15 +549,8 @@ fn spawn_worker(launcher: &str) -> Result<(WorkerProcess, u32), WorkerError> {
     let pid = child.id();
     let stdin = child
         .stdin
- 
-/// Detect a worker "not_authenticated" error in a raw IPC response payload.
-/// The worker returns 401 JSON like {"detail":"...not_authenticated...",
-/// "error":"not_authenticated"} for authenticated ops when its Apple session
-/// restore failed.
-fn is_not_authenticated(payload: &[u8]) -> bool {
-    const NEEDLE: &[u8] = b"not_authenticated";
-    payload.windows(NEEDLE.len()).any(|w| w == NEEDLE)
-}        .ok_or_else(|| WorkerError::Io("worker stdin unavailable".to_string()))?;
+        .take()
+        .ok_or_else(|| WorkerError::Io("worker stdin unavailable".to_string()))?;
     let stdout = child
         .stdout
         .take()
@@ -575,6 +568,15 @@ fn reap_worker(mut proc: WorkerProcess, reason: &'static str) {
         let _ = proc.child.kill();
         let _ = proc.child.wait();
     });
+}
+
+/// Detect a worker "not_authenticated" error in a raw IPC response payload.
+/// The worker returns 401 JSON like {"detail":"...not_authenticated...",
+/// "error":"not_authenticated"} for authenticated ops when its Apple session
+/// restore failed.
+fn is_not_authenticated(payload: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"not_authenticated";
+    payload.windows(NEEDLE.len()).any(|w| w == NEEDLE)
 }
 
 fn write_frame_timeout(
