@@ -3,8 +3,6 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
-#include <chrono>
-#include <thread>
 #include <utility>
 
 #include <sys/stat.h>
@@ -160,28 +158,8 @@ bool Account::try_restore_cached_session(const Loader& loader, const Runtime& ru
         return false;
     }
     auto device_guid = runtime.device_guid_copy();
-    // harvest_all calls Apple's token-refresh endpoints. Under the worker pool,
-    // several workers can restore at once and Apple rate-limits the concurrent
-    // harvests, leaving a worker "not_authenticated" (the supervisor retries on
-    // that, but authenticating on first try avoids the retry latency). Retry
-    // with backoff so a transient rate-limit does not permanently cripple a
-    // worker. This runs during worker startup (before the IPC loop), so the
-    // supervisor's first write simply waits for readiness — within its own
-    // request deadline.
     Tokens t;
-    bool harvested = false;
-    for (int attempt = 1; attempt <= 3 && !harvested; ++attempt) {
-        t = Tokens{};
-        harvested = tokens::harvest_all(s, req_ctx, device_guid, &t);
-        if (!harvested && attempt < 3) {
-            std::fprintf(stderr,
-                         "auth: cached-session restore token harvest failed "
-                         "(attempt %d/3), retrying in %ds\n",
-                         attempt, attempt);
-            std::this_thread::sleep_for(std::chrono::seconds(attempt));
-        }
-    }
-    if (!harvested) {
+    if (!tokens::harvest_all(s, req_ctx, device_guid, &t)) {
         std::fprintf(stderr,
                      "auth: cached-session restore found Apple session files "
                      "but token harvest failed\n");
