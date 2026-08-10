@@ -378,14 +378,15 @@ impl Worker {
                 Ok(g) => g,
                 Err(_) => return,
             };
+            let mut found = None;
             for slot in pool.iter_mut() {
                 if !slot.leased && slot.proc.is_some() {
-                    let proc = slot.proc.take();
+                    found = slot.proc.take();
                     slot.pid = 0;
-                    return proc;
+                    break;
                 }
             }
-            None
+            found
         };
         if let Some(proc) = old {
             self.record_restart("restart requested by worker response");
@@ -542,7 +543,7 @@ fn spawn_worker(launcher: &str) -> Result<(WorkerProcess, u32), WorkerError> {
 
 /// Kill + reap a worker process in the background so a wedged child never
 /// blocks the supervisor.
-fn reap_worker(proc: WorkerProcess, reason: &'static str) {
+fn reap_worker(mut proc: WorkerProcess, reason: &'static str) {
     thread::spawn(move || {
         eprintln!("wrapperd: cleaning up worker: {reason}");
         let _ = proc.child.kill();
