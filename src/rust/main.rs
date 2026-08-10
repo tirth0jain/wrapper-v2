@@ -179,10 +179,13 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
                 }),
             )?;
         }
-        ("GET", "/me") => proxy_json(
-            &mut stream,
-            worker.request_json(protocol::OP_ME, Value::Null),
-        )?,
+        ("GET", "/me") => {
+            let _playback_guard = worker.lock_playback();
+            proxy_json(
+                &mut stream,
+                worker.request_json(protocol::OP_ME, Value::Null),
+            )?
+        }
         ("POST", "/login") => {
             let v = match parse_json_body(&body) {
                 Ok(v) => v,
@@ -222,6 +225,9 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
                 .or_else(|| params.get("adamId"))
                 .cloned()
                 .unwrap_or_default();
+            // Serialize across pool workers: the Apple session DB is shared and
+            // concurrent playback fetches trip SQLite "database is locked".
+            let _playback_guard = worker.lock_playback();
             proxy_json(
                 &mut stream,
                 worker.request_json(protocol::OP_PLAYBACK, json!({"adam_id": adam_id})),

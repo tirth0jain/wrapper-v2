@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -62,6 +62,7 @@ pub struct Worker {
     waiting_count: AtomicU32,
     pool: Mutex<Vec<WorkerSlot>>,
     state: Mutex<WorkerState>,
+    playback_lock: Mutex<()>,
 }
 
 struct WorkerState {
@@ -109,6 +110,7 @@ impl Worker {
                 last_error: None,
                 last_restart_reason: None,
             }),
+            playback_lock: Mutex::new(()),
         }
     }
 
@@ -138,6 +140,15 @@ impl Worker {
 
     pub fn health(&self) -> Result<WorkerResponse, WorkerError> {
         self.request_json(protocol::OP_HEALTH, Value::Null)
+    }
+
+    /// The Apple session DB (mpl_db/kvs.sqlitedb) is shared across ALL pool
+    /// workers. Concurrent playback fetches on different workers trip SQLite
+    /// "database is locked" (surfaces as a wrapper 500 "concurrent activity
+    /// by another connection" -> gamdl "no audio file found"). Serialize
+    /// session-touching ops (playback, /me) here; decrypt stays parallel.
+    pub fn lock_playback(&self) -> MutexGuard<'_, ()> {
+        self.playback_lock.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     pub fn snapshot(&self) -> Value {
