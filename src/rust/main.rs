@@ -133,6 +133,17 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
         }
     }
 
+    // Cap the request body so a bad client cannot force a huge allocation
+    // (login bodies are tiny).
+    const MAX_BODY: usize = 1024 * 1024; // 1 MiB
+    if content_length > MAX_BODY {
+        write_json(
+            &mut stream,
+            413,
+            json!({"error": "payload_too_large"}),
+        )?;
+        return Ok(());
+    }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body)?;

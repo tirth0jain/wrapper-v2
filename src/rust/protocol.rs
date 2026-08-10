@@ -23,6 +23,11 @@ pub const DECRYPT_KIND_CLOSE: u16 = 9;
 const HEADER_LEN: usize = 20;
 const DECRYPT_HEADER_LEN: usize = 16;
 
+/// Upper bound for a single decrypt frame payload. The C++ worker enforces the
+/// same 256MB cap, so rejecting oversized frames here prevents an untrusted or
+/// buggy decrypt client from forcing a huge allocation in the supervisor.
+pub const MAX_DECRYPT_PAYLOAD: usize = 256 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub kind: u16,
@@ -77,6 +82,12 @@ pub fn read_decrypt_frame(mut r: impl Read) -> io::Result<DecryptFrame> {
     let kind = u16::from_be_bytes([h[6], h[7]]);
     let request_id = u32::from_be_bytes([h[8], h[9], h[10], h[11]]);
     let payload_len = u32::from_be_bytes([h[12], h[13], h[14], h[15]]) as usize;
+    if payload_len > MAX_DECRYPT_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decrypt frame payload too large",
+        ));
+    }
     let mut payload = vec![0u8; payload_len];
     r.read_exact(&mut payload)?;
     Ok(DecryptFrame {
