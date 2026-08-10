@@ -212,63 +212,82 @@ impl Worker {
     }
 
     fn request(&self, opcode: u16, payload: Vec<u8>) -> Result<protocol::Frame, WorkerError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let deadline = Instant::now() + self.request_timeout;
-        let mut lw = self.acquire(id, opcode)?;
+        let mut retried = 0u32;
+        loop {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let deadline = Instant::now() + self.request_timeout;
+            let mut lw = self.acquire(id, opcode)?;
 
-        let req = protocol::Frame {
-            kind: protocol::KIND_REQUEST,
-            request_id: id,
-            opcode,
-            flags: 0,
-            payload,
-        };
+            let req = protocol::Frame {
+                kind: protocol::KIND_REQUEST,
+                request_id: id,
+                opcode,
+                flags: 0,
+                payload: payload.clone(),
+            };
 
-        if let Err(e) = write_frame_timeout(&mut lw.proc_mut().stdin, &req, deadline) {
-            if e.kind() == io::ErrorKind::TimedOut {
-                eprintln!(
-                    "wrapperd: worker request opcode={opcode} timed out while writing after {:?}; discarding worker",
-                    self.request_timeout
-                );
-                self.timeout_count.fetch_add(1, Ordering::Relaxed);
-            } else {
-                eprintln!(
-                    "wrapperd: worker request opcode={opcode} ipc write error: {e}; discarding worker"
-                );
-            }
-            self.record_error(e.to_string());
-            lw.discard();
-            return Err(WorkerError::Io(e.to_string()));
-        }
-
-        let resp = match read_frame_timeout(&mut lw.proc_mut().stdout, deadline) {
-            Ok(frame) => frame,
-            Err(e) => {
+            if let Err(e) = write_frame_timeout(&mut lw.proc_mut().stdin, &req, deadline) {
                 if e.kind() == io::ErrorKind::TimedOut {
                     eprintln!(
-                        "wrapperd: worker request opcode={opcode} timed out after {:?}; discarding worker",
+                        "wrapperd: worker request opcode={opcode} timed out while writing after {:?}; discarding worker",
                         self.request_timeout
                     );
                     self.timeout_count.fetch_add(1, Ordering::Relaxed);
                 } else {
                     eprintln!(
-                        "wrapperd: worker request opcode={opcode} ipc read error: {e}; discarding worker"
+                        "wrapperd: worker request opcode={opcode} ipc write error: {e}; discarding worker"
                     );
                 }
                 self.record_error(e.to_string());
                 lw.discard();
                 return Err(WorkerError::Io(e.to_string()));
             }
-        };
 
-        if resp.kind != protocol::KIND_RESPONSE || resp.request_id != id || resp.opcode != opcode {
-            self.record_error("mismatched ipc response");
-            lw.discard();
-            return Err(WorkerError::Protocol("mismatched ipc response".to_string()));
+            let resp = match read_frame_timeout(&mut lw.proc_mut().stdout, deadline) {
+                Ok(frame) => frame,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::TimedOut {
+                        eprintln!(
+                            "wrapperd: worker request opcode={opcode} timed out after {:?}; discarding worker",
+                            self.request_timeout
+                        );
+                        self.timeout_count.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        eprintln!(
+                            "wrapperd: worker request opcode={opcode} ipc read error: {e}; discarding worker"
+                        );
+                    }
+                    self.record_error(e.to_string());
+                    lw.discard();
+                    return Err(WorkerError::Io(e.to_string()));
+                }
+            };
+
+            if resp.kind != protocol::KIND_RESPONSE || resp.request_id != id || resp.opcode != opcode {
+                self.record_error("mismatched ipc response");
+                lw.discard();
+                return Err(WorkerError::Protocol("mismatched ipc response".to_string()));
+            }
+
+            // A worker whose Apple session restore failed answers authenticated
+            // ops with 401 "not_authenticated". Discard it (its slot becomes
+            // empty and the next request spawns a fresh worker) and retry up to
+            // 2× on a different worker. This makes the pool tolerant of one or
+            // two degraded workers while the rest stay healthy — without it,
+            // ~1 in 3 concurrent rips fails when a request lands on a
+            // not_authenticated worker.
+            if retried < 2 && is_not_authenticated(&resp.payload) {
+                retried += 1;
+                eprintln!(
+                    "wrapperd: worker request opcode={opcode} got not_authenticated; discarding worker and retrying (attempt {retried})"
+                );
+                lw.discard();
+                continue;
+            }
+
+            drop(lw);
+            return Ok(resp);
         }
-
-        drop(lw);
-        Ok(resp)
     }
 
     /// Check a worker process out of the pool for one request. Reuses an idle
@@ -530,8 +549,15 @@ fn spawn_worker(launcher: &str) -> Result<(WorkerProcess, u32), WorkerError> {
     let pid = child.id();
     let stdin = child
         .stdin
-        .take()
-        .ok_or_else(|| WorkerError::Io("worker stdin unavailable".to_string()))?;
+ 
+/// Detect a worker "not_authenticated" error in a raw IPC response payload.
+/// The worker returns 401 JSON like {"detail":"...not_authenticated...",
+/// "error":"not_authenticated"} for authenticated ops when its Apple session
+/// restore failed.
+fn is_not_authenticated(payload: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"not_authenticated";
+    payload.windows(NEEDLE.len()).any(|w| w == NEEDLE)
+}        .ok_or_else(|| WorkerError::Io("worker stdin unavailable".to_string()))?;
     let stdout = child
         .stdout
         .take()
