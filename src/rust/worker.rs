@@ -237,6 +237,14 @@ impl Worker {
                 payload: payload.clone(),
             };
 
+            // An IPC transport failure (write/read timeout, or the worker
+            // process died) is a HEALTH failure, not a request failure — the
+            // op may not even have reached the worker. Treat it like a
+            // degraded worker: discard it (its slot spawns a fresh process)
+            // and retry the SAME request up to 2×. Most of these are
+            // transient — a busy/slow worker under concurrent rip load — so
+            // the retry on a fresh idle worker usually completes. Genuinely
+            // broken workers still fail after the retries (bounded).
             if let Err(e) = write_frame_timeout(&mut lw.proc_mut().stdin, &req, deadline) {
                 if e.kind() == io::ErrorKind::TimedOut {
                     eprintln!(
@@ -248,6 +256,14 @@ impl Worker {
                     eprintln!(
                         "wrapperd: worker request opcode={opcode} ipc write error: {e}; discarding worker"
                     );
+                }
+                if retried < 2 {
+                    retried += 1;
+                    eprintln!(
+                        "wrapperd: opcode={opcode} ipc write failure — retrying on a fresh worker (attempt {retried})"
+                    );
+                    lw.discard();
+                    continue;
                 }
                 self.record_error(e.to_string());
                 lw.discard();
@@ -267,6 +283,14 @@ impl Worker {
                         eprintln!(
                             "wrapperd: worker request opcode={opcode} ipc read error: {e}; discarding worker"
                         );
+                    }
+                    if retried < 2 {
+                        retried += 1;
+                        eprintln!(
+                            "wrapperd: opcode={opcode} ipc read failure — retrying on a fresh worker (attempt {retried})"
+                        );
+                        lw.discard();
+                        continue;
                     }
                     self.record_error(e.to_string());
                     lw.discard();
@@ -527,7 +551,13 @@ fn worker_timeout() -> Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
         .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(60))
+        // 45s: comfortably under the addon's 60s rip timeout while giving a
+        // slow-but-progressing worker (large decrypt batch under concurrent
+        // rip load) room to finish. Must stay below the addon's rip timeout —
+        // with the retry-on-timeout, two full-timeout attempts (90s) exceed
+        // it, but retried attempts on a FRESH idle worker typically complete
+        // in a few seconds, so the budget is only stressed in the worst case.
+        .unwrap_or_else(|| Duration::from_secs(45))
 }
 
 /// Number of independent Android worker processes for this wrapper instance.

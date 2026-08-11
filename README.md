@@ -274,7 +274,8 @@ The daemon reads `WRAPPER_*` environment variables (forwarded via
 - `WRAPPER_MODE` - internal C++ worker mode. Normal users should not set it;
   the Rust supervisor sets `ipc-worker` automatically.
 - `WRAPPER_WORKER_TIMEOUT_SECS` - timeout for one IPC request to the C++
-  Apple worker. Default is `60`.
+  Apple worker. Default is `45`. IPC timeouts/worker deaths are retried up to
+  2× on a fresh worker, so keep this under the addon's rip timeout.
 - `WRAPPER_BASE_DIR` - filesystem dir Apple's libs use for the FPS
   key cache and `mpl_db`. The default matches upstream wrapper.
 - `WRAPPER_RESTORE_SESSION` - set to `0` to skip startup token harvest from
