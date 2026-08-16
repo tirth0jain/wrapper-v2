@@ -34,6 +34,16 @@ services:
       WRAPPER_PASSWORD: ${WRAPPER_PASSWORD:-}
       WRAPPER_APPLE_INIT: ${WRAPPER_APPLE_INIT:-}
       WRAPPER_RUNTIME_TRACE: ${WRAPPER_RUNTIME_TRACE:-}
+      # Full wrapperd debug log (all stderr output + trace). File is truncated
+      # on every startup so each build starts clean.
+      WRAPPER_LOG_FILE: ${WRAPPER_LOG_FILE:-/app/logs/wrapper-debug.log}
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     volumes:
       # Persist Apple state at the same path shape as the Android app sandbox.
       - ./data:/app/rootfs/data/data/com.apple.android.music/files
+      # Full wrapperd debug log on the host (survives container restarts).
+      - ./logs:/app/logs

@@ -1,3 +1,4 @@
+mod logfile;
 mod protocol;
 mod worker;
 
@@ -26,6 +27,9 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
+    logfile::init();
+    logfile::log("wrapperd starting (supervisor v{VERSION})");
+
     let http_host = env_or("WRAPPER_HOST", DEFAULT_HTTP_HOST);
     let http_port = env_u16("WRAPPER_PORT", DEFAULT_HTTP_PORT);
     let decrypt_host = env_or("WRAPPER_DECRYPT_HOST", DEFAULT_DECRYPT_HOST);
@@ -68,18 +72,18 @@ fn worker_io_error(e: WorkerError) -> io::Error {
 
 fn run_http(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    eprintln!("wrapperd: {VERSION} HTTP listening on {addr}");
+    logfile::log(&format!("wrapperd: {VERSION} HTTP listening on {addr}"));
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
                 let worker = Arc::clone(&worker);
                 thread::spawn(move || {
                     if let Err(e) = handle_http_connection(stream, worker) {
-                        eprintln!("wrapperd: http connection error: {e}");
+                        logfile::log(&format!("wrapperd: http connection error: {e}"));
                     }
                 });
             }
-            Err(e) => eprintln!("wrapperd: http accept error: {e}"),
+            Err(e) => logfile::log(&format!("wrapperd: http accept error: {e}")),
         }
     }
     Ok(())
@@ -150,7 +154,7 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
     }
 
     let (path, query) = split_target(&target);
-    eprintln!("http: {method} {target}");
+    logfile::log(&format!("http: {method} {target} from {}", stream.peer_addr().map(|a| a.to_string()).unwrap_or_default()));
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/health") => {
@@ -350,18 +354,18 @@ fn write_response(
 
 fn run_decrypt_tcp(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    eprintln!("wrapperd: {VERSION} TCP decrypt listening on {addr}");
+    logfile::log(&format!("wrapperd: {VERSION} TCP decrypt listening on {addr}"));
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
                 let worker = Arc::clone(&worker);
                 thread::spawn(move || {
                     if let Err(e) = handle_decrypt_client(stream, worker) {
-                        eprintln!("wrapperd: decrypt client closed: {e}");
+                        logfile::log(&format!("wrapperd: decrypt client closed: {e}"));
                     }
                 });
             }
-            Err(e) => eprintln!("wrapperd: decrypt accept error: {e}"),
+            Err(e) => logfile::log(&format!("wrapperd: decrypt accept error: {e}")),
         }
     }
     Ok(())
@@ -401,20 +405,33 @@ fn handle_decrypt_client(mut stream: TcpStream, worker: Arc<Worker>) -> io::Resu
             }
         };
         if !logged_session {
-            eprintln!(
-                "wrapperd: decrypt client {peer} adam={} fps_key_uri={}",
-                adam, uri
-            );
+            logfile::log(&format!("wrapperd: decrypt client {peer} adam={adam} fps_key_uri={uri}"));
             logged_session = true;
         }
+        if logfile::trace_enabled() {
+            logfile::log(&format!(
+                "trace: decrypt batch peer={peer} adam={adam} uri={uri} samples={} total_bytes={}",
+                samples.len(),
+                samples.iter().map(|s| s.len()).sum::<usize>()
+            ));
+        }
+        let start = std::time::Instant::now();
         let plaintexts = match worker.decrypt_batch(&adam, &uri, samples) {
             Ok(p) => p,
             Err(e) => {
+                logfile::log(&format!("wrapperd: decrypt error peer={peer} adam={adam}: {e}"));
                 let _ = write_decrypt_error(&mut stream, frame.request_id, &e.to_string());
                 let _ = stream.shutdown(Shutdown::Both);
                 return Err(worker_io_error(e));
             }
         };
+        if logfile::trace_enabled() {
+            logfile::log(&format!(
+                "trace: decrypt ok peer={peer} adam={adam} in {:?} plaintext_samples={}",
+                start.elapsed(),
+                plaintexts.len()
+            ));
+        }
         let payload = build_decrypt_samples_payload(&plaintexts)?;
         protocol::write_decrypt_frame(
             &mut stream,

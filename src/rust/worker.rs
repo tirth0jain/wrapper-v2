@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::logfile;
 use crate::protocol;
 
 #[derive(Debug)]
@@ -39,6 +40,21 @@ struct WorkerProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
+}
+
+/// Forward a worker's stderr lines to the shared log file (so the C++
+/// daemon's loader/session/decrypt messages land in wrapper-debug.log, not
+/// just docker logs). Runs until the pipe closes (worker exit).
+fn pipe_worker_stderr(reader: std::io::BufReader<std::process::ChildStderr>) {
+    use std::io::BufRead;
+    thread::spawn(move || {
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => logfile::log(&format!("worker: {l}")),
+                _ => {}
+            }
+        }
+    });
 }
 
 /// One slot in the worker pool. `proc` is None when the slot is empty (never
@@ -247,21 +263,21 @@ impl Worker {
             // broken workers still fail after the retries (bounded).
             if let Err(e) = write_frame_timeout(&mut lw.proc_mut().stdin, &req, deadline) {
                 if e.kind() == io::ErrorKind::TimedOut {
-                    eprintln!(
+                    logfile::log(&format!(
                         "wrapperd: worker request opcode={opcode} timed out while writing after {:?}; discarding worker",
                         self.request_timeout
-                    );
+                    ));
                     self.timeout_count.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    eprintln!(
+                    logfile::log(&format!(
                         "wrapperd: worker request opcode={opcode} ipc write error: {e}; discarding worker"
-                    );
+                    ));
                 }
                 if retried < 2 {
                     retried += 1;
-                    eprintln!(
+                    logfile::log(&format!(
                         "wrapperd: opcode={opcode} ipc write failure — retrying on a fresh worker (attempt {retried})"
-                    );
+                    ));
                     lw.discard();
                     continue;
                 }
@@ -274,21 +290,21 @@ impl Worker {
                 Ok(frame) => frame,
                 Err(e) => {
                     if e.kind() == io::ErrorKind::TimedOut {
-                        eprintln!(
+                        logfile::log(&format!(
                             "wrapperd: worker request opcode={opcode} timed out after {:?}; discarding worker",
                             self.request_timeout
-                        );
+                        ));
                         self.timeout_count.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        eprintln!(
+                        logfile::log(&format!(
                             "wrapperd: worker request opcode={opcode} ipc read error: {e}; discarding worker"
-                        );
+                        ));
                     }
                     if retried < 2 {
                         retried += 1;
-                        eprintln!(
+                        logfile::log(&format!(
                             "wrapperd: opcode={opcode} ipc read failure — retrying on a fresh worker (attempt {retried})"
-                        );
+                        ));
                         lw.discard();
                         continue;
                     }
@@ -313,9 +329,9 @@ impl Worker {
             // not_authenticated worker.
             if retried < 2 && is_not_authenticated(&resp.payload) {
                 retried += 1;
-                eprintln!(
+                logfile::log(&format!(
                     "wrapperd: worker request opcode={opcode} got not_authenticated; discarding worker and retrying (attempt {retried})"
-                );
+                ));
                 lw.discard();
                 continue;
             }
@@ -411,10 +427,10 @@ impl Worker {
                 // 3. All workers busy.
                 if Instant::now() >= deadline {
                     self.timeout_count.fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
+                    logfile::log(&format!(
                         "wrapperd: worker request opcode={opcode} timed out waiting for a free worker after {:?}",
                         self.request_timeout
-                    );
+                    ));
                     return Err(WorkerError::Unavailable(
                         "worker pool busy timed out".to_string(),
                     ));
@@ -579,14 +595,19 @@ fn io_err(e: io::Error) -> WorkerError {
 /// Spawn a fresh Android worker process. Does not touch the pool (the caller
 /// holds the pool lock) — returns the process and its pid.
 fn spawn_worker(launcher: &str) -> Result<(WorkerProcess, u32), WorkerError> {
-    eprintln!("wrapperd: starting ipc worker {launcher}");
+    logfile::log(&format!("wrapperd: starting ipc worker {launcher}"));
     let mut child = Command::new(launcher)
         .env("WRAPPER_MODE", "ipc-worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(io_err)?;
+    // Pipe the worker's stderr into the shared log file so nothing the C++
+    // daemon prints is lost (loader warnings, session restore, decrypt errors).
+    if let Some(stderr) = child.stderr.take() {
+        pipe_worker_stderr(std::io::BufReader::new(stderr));
+    }
     let pid = child.id();
     let stdin = child
         .stdin
@@ -605,7 +626,7 @@ fn spawn_worker(launcher: &str) -> Result<(WorkerProcess, u32), WorkerError> {
 /// blocks the supervisor.
 fn reap_worker(mut proc: WorkerProcess, reason: &'static str) {
     thread::spawn(move || {
-        eprintln!("wrapperd: cleaning up worker: {reason}");
+        logfile::log(&format!("wrapperd: cleaning up worker: {reason}"));
         let _ = proc.child.kill();
         let _ = proc.child.wait();
     });
