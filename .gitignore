@@ -3,10 +3,23 @@
 # Runtime/session data mounted by compose.yaml.
 /data/
 
+# Local secrets: Apple ID credentials / wrapper config. Never commit.
+/.env
+.env
+
+# Runtime logs (wrapper-debug.log etc). Backed up with the mount, not git.
+/logs/
+*.log
+
 # Generated chroot contents. Keep placeholders tracked, but do not commit
-# staged Android system files or extracted Apple Music libraries.
+# staged Android system files or extracted Apple Music libraries (proprietary).
 /rootfs/system/bin/*
 !/rootfs/system/bin/.gitkeep
 /rootfs/system/lib64/*
 !/rootfs/system/lib64/.gitkeep
 /rootfs/system/usr/
+
+# Stray runtime files that live only in the deployment (backed up with mount).
+/apkd/
+/cloudflare.log
+/N_m3u8DL-RE
