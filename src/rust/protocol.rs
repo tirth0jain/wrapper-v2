@@ -15,6 +15,7 @@ pub const OP_DECRYPT_BATCH: u16 = 7;
 
 pub const DECRYPT_MAGIC: u32 = 0x57563244; // WV2D
 pub const DECRYPT_VERSION: u16 = 1;
+pub const DECRYPT_KIND_AUTH: u16 = 4;
 pub const DECRYPT_KIND_BATCH: u16 = 1;
 pub const DECRYPT_KIND_OK: u16 = 2;
 pub const DECRYPT_KIND_ERROR: u16 = 3;

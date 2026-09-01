@@ -34,21 +34,37 @@ fn run() -> io::Result<()> {
     let http_port = env_u16("WRAPPER_PORT", DEFAULT_HTTP_PORT);
     let decrypt_host = env_or("WRAPPER_DECRYPT_HOST", DEFAULT_DECRYPT_HOST);
     let decrypt_port = env_u16("WRAPPER_DECRYPT_PORT", DEFAULT_DECRYPT_PORT);
+    // Shared-secret auth (remote rip mode). Empty = disabled (local mode).
+    // WRAPPER_DECRYPT_TOKEN falls back to WRAPPER_TOKEN so a single
+    // REMOTE_RIP_TOKEN can drive both surfaces.
+    let http_token = env::var("WRAPPER_TOKEN").unwrap_or_default();
+    let decrypt_token = {
+        let t = env::var("WRAPPER_DECRYPT_TOKEN").unwrap_or_default();
+        if t.is_empty() { http_token.clone() } else { t }
+    };
+    if !http_token.is_empty() {
+        logfile::log("wrapperd: HTTP bearer auth ENABLED");
+    } else {
+        logfile::log("wrapperd: HTTP bearer auth DISABLED (no WRAPPER_TOKEN)");
+    }
+    if !decrypt_token.is_empty() {
+        logfile::log("wrapperd: decrypt AUTH handshake ENABLED");
+    }
 
-    let worker = Arc::new(Worker::new("/app/wrapper", VERSION.to_string()));
+    let worker = Arc::new(Worker::new(&env_or("WRAPPER_LAUNCHER", "/app/wrapper"), VERSION.to_string()));
     worker.ensure_started().map_err(worker_io_error)?;
 
     let tcp_worker = Arc::clone(&worker);
     let tcp_addr = format!("{decrypt_host}:{decrypt_port}");
     thread::spawn(move || {
-        if let Err(e) = run_decrypt_tcp(&tcp_addr, tcp_worker) {
+        if let Err(e) = run_decrypt_tcp(&tcp_addr, tcp_worker, &decrypt_token) {
             eprintln!("wrapperd: decrypt tcp listener stopped: {e}");
             std::process::exit(1);
         }
     });
 
     let http_addr = format!("{http_host}:{http_port}");
-    run_http(&http_addr, worker)
+    run_http(&http_addr, worker, &http_token)
 }
 
 fn env_or(name: &str, fallback: &str) -> String {
@@ -70,15 +86,17 @@ fn worker_io_error(e: WorkerError) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e.to_string())
 }
 
-fn run_http(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
+fn run_http(addr: &str, worker: Arc<Worker>, bearer_token: &str) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     logfile::log(&format!("wrapperd: {VERSION} HTTP listening on {addr}"));
+    let token = bearer_token.to_string();
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
                 let worker = Arc::clone(&worker);
+                let token = token.clone();
                 thread::spawn(move || {
-                    if let Err(e) = handle_http_connection(stream, worker) {
+                    if let Err(e) = handle_http_connection(stream, worker, &token) {
                         logfile::log(&format!("wrapperd: http connection error: {e}"));
                     }
                 });
@@ -89,7 +107,40 @@ fn run_http(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
     Ok(())
 }
 
-fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Result<()> {
+/// Constant-time equality so a remote party cannot time-token-guess the
+/// secret byte by byte. Lengths differ → not equal (early return fine; length
+/// is not secret-relevant for a random hex token).
+fn token_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// Extracts the Bearer token from parsed HTTP headers.
+/// Returns Some(token) when an Authorization header is present and well-formed.
+fn extract_bearer<'a>(
+    req: &'a httparse::Request<'_, '_>,
+) -> Option<&'a str> {
+    for h in req.headers.iter() {
+        if h.name.eq_ignore_ascii_case("authorization") {
+            let v = std::str::from_utf8(h.value).ok()?;
+            return v.strip_prefix("Bearer ").map(|t| t.trim());
+        }
+    }
+    None
+}
+
+fn handle_http_connection(
+    mut stream: TcpStream,
+    worker: Arc<Worker>,
+    bearer_token: &str,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(70)))?;
     stream.set_write_timeout(Some(Duration::from_secs(70)))?;
 
@@ -155,6 +206,24 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
 
     let (path, query) = split_target(&target);
     logfile::log(&format!("http: {method} {target} from {}", stream.peer_addr().map(|a| a.to_string()).unwrap_or_default()));
+
+    // Shared-secret gate: every route except /health requires
+    // "Authorization: Bearer <token>" when WRAPPER_TOKEN is set. /health stays
+    // open so docker healthchecks and port probes keep working.
+    if !bearer_token.is_empty() && path != "/health" {
+        match extract_bearer(&req) {
+            Some(t) if token_eq(t, bearer_token) => {}
+            _ => {
+                logfile::log(&format!(
+                    "http: 401 {} from {} (bad or missing bearer)",
+                    path,
+                    stream.peer_addr().map(|a| a.to_string()).unwrap_or_default()
+                ));
+                write_json(&mut stream, 401, json!({"error":"unauthorized"}))?;
+                return Ok(());
+            }
+        }
+    }
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/health") => {
@@ -352,15 +421,17 @@ fn write_response(
     stream.write_all(body)
 }
 
-fn run_decrypt_tcp(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
+fn run_decrypt_tcp(addr: &str, worker: Arc<Worker>, decrypt_token: &str) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     logfile::log(&format!("wrapperd: {VERSION} TCP decrypt listening on {addr}"));
+    let token = decrypt_token.to_string();
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
                 let worker = Arc::clone(&worker);
+                let token = token.clone();
                 thread::spawn(move || {
-                    if let Err(e) = handle_decrypt_client(stream, worker) {
+                    if let Err(e) = handle_decrypt_client(stream, worker, &token) {
                         logfile::log(&format!("wrapperd: decrypt client closed: {e}"));
                     }
                 });
@@ -371,10 +442,67 @@ fn run_decrypt_tcp(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
     Ok(())
 }
 
-fn handle_decrypt_client(mut stream: TcpStream, worker: Arc<Worker>) -> io::Result<()> {
+/// Decrypt-port handshake. When `decrypt_token` is non-empty the client MUST
+/// send an AUTH frame as its very first frame:
+///   kind = DECRYPT_KIND_AUTH (4), payload = "AUTH <token>"
+/// The server replies with DECRYPT_KIND_OK (empty payload) or
+/// DECRYPT_KIND_ERROR ("auth_failed") and closes. Non-AUTH first frames get
+/// the same rejection. A 5 s read deadline covers the handshake so a silent
+/// client can't hold a thread slot.
+fn handle_decrypt_client(
+    mut stream: TcpStream,
+    worker: Arc<Worker>,
+    decrypt_token: &str,
+) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     stream.set_write_timeout(Some(Duration::from_secs(60)))?;
+
+    if !decrypt_token.is_empty() {
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let auth_frame = match protocol::read_decrypt_frame(&mut stream) {
+            Ok(f) => f,
+            Err(e) => {
+                logfile::log(&format!(
+                    "wrapperd: decrypt auth read failed from {}: {e}",
+                    stream.peer_addr().map(|a| a.to_string()).unwrap_or_default()
+                ));
+                return Ok(());
+            }
+        };
+        let ok = auth_frame.kind == protocol::DECRYPT_KIND_AUTH
+            && auth_frame.payload.starts_with(b"AUTH ")
+            && std::str::from_utf8(&auth_frame.payload[5..])
+                .map(|t| token_eq(t.trim_end_matches(['\r', '\n']), decrypt_token))
+                .unwrap_or(false);
+        if ok {
+            protocol::write_decrypt_frame(
+                &mut stream,
+                &protocol::DecryptFrame {
+                    kind: protocol::DECRYPT_KIND_OK,
+                    request_id: auth_frame.request_id,
+                    payload: Vec::new(),
+                },
+            )?;
+        } else {
+            logfile::log(&format!(
+                "wrapperd: decrypt AUTH rejected from {}",
+                stream.peer_addr().map(|a| a.to_string()).unwrap_or_default()
+            ));
+            let _ = protocol::write_decrypt_frame(
+                &mut stream,
+                &protocol::DecryptFrame {
+                    kind: protocol::DECRYPT_KIND_ERROR,
+                    request_id: auth_frame.request_id,
+                    payload: b"auth_failed".to_vec(),
+                },
+            );
+            let _ = stream.shutdown(Shutdown::Both);
+            return Ok(());
+        }
+        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+    }
+
     let peer = stream
         .peer_addr()
         .map(|addr| addr.to_string())
